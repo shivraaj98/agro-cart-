@@ -455,6 +455,81 @@ const ORDERS_DEMO = [
   { id:"HB-7816", product:"Ilam Tea First Flush",  qty:10, amount:10200, status:"Delivered",  date:"2081-01-12", buyer:"Bimala Sharma",     pay:"ConnectIPS" },
 ];
 
+const ORDER_STATUSES = ["Pending","Processing","Shipped","Delivered"];
+
+const DEMAND_SCORE = { "Very High":95, High:82, Medium:58, Low:34 };
+const ZONE_LOGISTICS = { Urban:90, Terai:130, "Mid-Hill":180, "Eastern Hill":190, Mountain:260, "Remote Hill":320 };
+
+const calcLogisticsCharge = (subtotal=0, district="", items=[]) => {
+  const zones = items.map(i=>i.zone).filter(Boolean);
+  const zone = zones.includes("Remote Hill") ? "Remote Hill"
+    : zones.includes("Mountain") ? "Mountain"
+    : zones.includes("Mid-Hill") ? "Mid-Hill"
+    : zones.includes("Terai") ? "Terai"
+    : zones[0] || "Urban";
+  const districtAdd = ["Jumla","Mustang","Sindhupalchok"].includes(district) ? 80 : 0;
+  const weightUnits = items.reduce((s,i)=>s+(i.qty||1),0);
+  const bulkAdd = Math.max(0, weightUnits - 5) * 12;
+  const discount = subtotal >= 5000 ? 80 : subtotal >= 2000 ? 40 : 0;
+  return Math.max(0, (ZONE_LOGISTICS[zone] || 150) + districtAdd + bulkAdd - discount);
+};
+
+const historyKeyFor = p => {
+  const name = p.name.toLowerCase();
+  if (name.includes("tomato")) return "tomato";
+  if (name.includes("apple")) return "apple";
+  if (name.includes("rice")) return "rice";
+  if (name.includes("wheat")) return "wheat";
+  return null;
+};
+
+const priceSeriesFor = p => {
+  const key = historyKeyFor(p);
+  if (key) return PRICE_HISTORY.map(x=>x[key]);
+  const base = fp(p);
+  const demandBoost = ((DEMAND_SCORE[p.demand] || 60) - 60) / 100;
+  return [-0.10,-0.04,0.02,0.00,0.05,0.09,0.07,0.12].map((d,i)=>
+    Math.max(1, Math.round(base * (1 + d + demandBoost * 0.12 + (i % 2 ? 0.015 : -0.01))))
+  );
+};
+
+const forecastProduct = p => {
+  const series = priceSeriesFor(p);
+  const last = series[series.length - 1] || fp(p);
+  const prev = series[series.length - 2] || last;
+  const trend = (last - series[0]) / Math.max(1, series.length - 1);
+  const demand = DEMAND_SCORE[p.demand] || 60;
+  const stockPressure = stockStatus(p) === "low" ? 1.08 : stockStatus(p) === "out" ? 0.94 : 1;
+  const demandPressure = 1 + (demand - 60) / 260;
+  const returns = series.slice(1).map((v,i)=>(v - series[i]) / Math.max(1, series[i]));
+  const avgRet = returns.reduce((s,v)=>s+v,0) / Math.max(1, returns.length);
+  const variance = returns.reduce((s,v)=>s+Math.pow(v - avgRet,2),0) / Math.max(1, returns.length);
+  const volatility = Math.sqrt(variance);
+  const arima = Math.round(last + trend * 2 + (last - prev) * 0.35);
+  const lstm = Math.round(last * demandPressure * stockPressure);
+  const garch = Math.round(last * (1 + Math.min(0.18, volatility * 1.8)) * (demand >= 80 ? 1.03 : 0.99));
+  const suggested = Math.round((arima * 0.34 + lstm * 0.42 + garch * 0.24) / 5) * 5;
+  const highDemand = demand >= 80;
+  const trendLabel = suggested > fp(p) * 1.05 ? "rising" : suggested < fp(p) * 0.95 ? "falling" : "stable";
+  return {
+    product:p.name,
+    current:fp(p),
+    arima,lstm,garch,suggested,
+    demandIndex:demand,
+    volatility:Math.round(volatility * 1000) / 10,
+    trend:trendLabel,
+    highDemand,
+    series:PRICE_HISTORY.map((x,i)=>({ m:x.m, actual:series[i], forecast: i >= series.length - 3 ? Math.round(series[i] * (1 + (suggested - last) / Math.max(1,last) * ((i - 4) / 4))) : null })),
+    recommendation: highDemand
+      ? "Demand is strong. Hold price near the suggested value and keep stock moving in smaller batches."
+      : "Demand is moderate. Use a competitive price and reduce logistics friction for faster conversion.",
+  };
+};
+
+const topDemandForecasts = (products=PRODUCTS) =>
+  [...products].map(p=>({ ...forecastProduct(p), id:p.id, img:p.img, unit:p.unit, seller:p.seller }))
+    .sort((a,b)=>b.demandIndex - a.demandIndex || b.suggested - a.suggested);
+
 const SEASONAL = {
   "Kharif (Baisakh–Ashadh)": ["Rice Seeds","Maize Seeds","DAP Fertilizer","Hand Sprayer","Vegetable Seedlings"],
   "Monsoon (Shrawan–Bhadra)":["Pesticides","Fungicides","Weeding Tools","Neem Pesticide"],
@@ -838,6 +913,8 @@ const Navbar = ({ user, cart, nav, logout, activeCat, setActiveCat, onSearch }) 
   const [q, setQ] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const catRef = useRef(null);
+  const userHomePage = user?.role==="admin" ? "admin" : user?.role==="seller" ? "seller" : user?.role==="delivery" ? "delivery" : "orders";
+  const userHomeLabel = user?.role==="admin" ? "Admin Dashboard" : user?.role==="seller" ? "Seller Dashboard" : user?.role==="delivery" ? "Delivery Panel" : "My Orders";
 
   const handleSearch = (val) => {
     setQ(val);
@@ -913,7 +990,7 @@ const Navbar = ({ user, cart, nav, logout, activeCat, setActiveCat, onSearch }) 
                     </span>
                   )}
                 </button>
-                <div onClick={()=>nav(user.role==="admin"?"admin":user.role==="seller"?"seller":"orders")}
+                <div onClick={()=>nav(userHomePage)}
                   style={{ display:"flex", alignItems:"center", gap:7, background:"#1C2A12",
                     borderRadius:8, padding:"8px 12px", cursor:"pointer" }}>
                   <div style={{ width:26, height:26, borderRadius:"50%", background:T.red,
@@ -971,10 +1048,10 @@ const Navbar = ({ user, cart, nav, logout, activeCat, setActiveCat, onSearch }) 
               <div style={{ color:"#fff", fontSize:13, fontFamily:"'Hind',sans-serif" }}>
                 👤 {user.name}
               </div>
-              <button onClick={()=>{ nav(user.role==="admin"?"admin":user.role==="seller"?"seller":"orders"); setMenuOpen(false); }}
+              <button onClick={()=>{ nav(userHomePage); setMenuOpen(false); }}
                 style={{ background:T.green, border:"none", borderRadius:8, padding:"8px 12px",
                   color:"#fff", fontSize:13, fontFamily:"'Hind',sans-serif", cursor:"pointer", textAlign:"left" }}>
-                {user.role==="admin"?"Admin Dashboard":user.role==="seller"?"Seller Dashboard":"My Orders"}
+                {userHomeLabel}
               </button>
               <button onClick={()=>{ logout(); setMenuOpen(false); }}
                 style={{ background:"none", border:`1px solid ${T.border}`, borderRadius:8,
@@ -1022,12 +1099,12 @@ const Navbar = ({ user, cart, nav, logout, activeCat, setActiveCat, onSearch }) 
 /* ─────────────────────────────────────────────────────────────
    HOME PAGE
 ───────────────────────────────────────────────────────────── */
-const HomePage = ({ nav, addCart, setActiveCat }) => {
+const HomePage = ({ nav, addCart, setActiveCat, products=PRODUCTS }) => {
   const bp = useBreakpoint();
   const timer = useTimer();
   const [season, setSeason] = useState(Object.keys(SEASONAL)[2]);
-  const trending  = PRODUCTS.filter(p => p.trending);
-  const flashSale = PRODUCTS.filter(p => p.flash);
+  const trending  = products.filter(p => p.trending);
+  const flashSale = products.filter(p => p.flash);
 
   const navCat = id => { setActiveCat(id); nav("products"); };
 
@@ -1255,7 +1332,7 @@ const HomePage = ({ nav, addCart, setActiveCat }) => {
 /* ─────────────────────────────────────────────────────────────
    PRODUCTS PAGE  ← COMPLETELY REWRITTEN & FIXED
 ───────────────────────────────────────────────────────────── */
-const ProductsPage = ({ nav, addCart, activeCat, setActiveCat, globalSearch }) => {
+const ProductsPage = ({ nav, addCart, activeCat, setActiveCat, globalSearch, products=PRODUCTS }) => {
   const bp = useBreakpoint();
   const geo = useGeo();
 
@@ -1269,7 +1346,7 @@ const ProductsPage = ({ nav, addCart, activeCat, setActiveCat, globalSearch }) =
   useEffect(() => { setSearch(globalSearch || ""); }, [globalSearch]);
 
   /* Enrich products with distance when GPS available */
-  const enriched = PRODUCTS.map(p => ({
+  const enriched = products.map(p => ({
     ...p,
     _dist: geo.coords ? haversine(geo.coords.lat, geo.coords.lng, p.lat, p.lng) : null,
   }));
@@ -1318,7 +1395,7 @@ const ProductsPage = ({ nav, addCart, activeCat, setActiveCat, globalSearch }) =
       <div>
         <div style={{ fontSize:11, fontWeight:700, color:T.textMuted, letterSpacing:1,
           textTransform:"uppercase", marginBottom:8 }}>Category</div>
-        {[{id:"all",name:"All Products",icon:"🏪",count:PRODUCTS.length},...CATEGORIES].map(c=>(
+        {[{id:"all",name:"All Products",icon:"🏪",count:products.length},...CATEGORIES].map(c=>(
           <div key={c.id} onClick={()=>{ setActiveCat(c.id); if(bp==="sm") setShowFilters(false); }}
             style={{ padding:"8px 10px", borderRadius:8, cursor:"pointer", marginBottom:2, fontSize:13,
               display:"flex", justifyContent:"space-between", alignItems:"center", fontFamily:"'Hind',sans-serif",
@@ -1599,7 +1676,7 @@ const StarPicker = ({ value, onChange, size=24 }) => (
   </div>
 );
 
-const ReviewsTab = ({ product:p }) => {
+const ReviewsTab = ({ product:p, onRatingSubmitted }) => {
   const bp = useBreakpoint();
 
   /* ── Reviews state ── */
@@ -1651,6 +1728,9 @@ const ReviewsTab = ({ product:p }) => {
       sellerReply: null,
     };
     setReviews(prev => [review, ...prev]);
+    const nextReviews = [review, ...reviews];
+    const nextAvg = nextReviews.reduce((s,r)=>s+r.rating,0) / nextReviews.length;
+    onRatingSubmitted?.(p.id, nextAvg, nextReviews.length);
     setNewRating(0); setNewText(""); setNewName(""); setFormError("");
     setSubmitted(true);
     setTimeout(()=>setSubmitted(false), 4000);
@@ -1939,7 +2019,7 @@ const ReviewsTab = ({ product:p }) => {
 /* ─────────────────────────────────────────────────────────────
    PRODUCT DETAIL
 ───────────────────────────────────────────────────────────── */
-const ProductDetail = ({ product:p, nav, addCart }) => {
+const ProductDetail = ({ product:p, nav, addCart, onRatingSubmitted }) => {
   const bp = useBreakpoint();
   const [qty, setQty] = useState(1);
   const [tab, setTab] = useState("overview");
@@ -1954,6 +2034,7 @@ const ProductDetail = ({ product:p, nav, addCart }) => {
 
   const status = stockStatus(p);
   const isOut  = status === "out";
+  const forecast = forecastProduct(p);
 
   const getAI = async () => {
     setAiLoading(true);
@@ -2161,7 +2242,42 @@ Respond ONLY with valid JSON, no markdown, no explanation outside JSON:
         )}
 
         {tab==="price" && (
+          <div style={{ display:"grid", gridTemplateColumns:bp==="sm"?"1fr":"2fr 1fr", gap:16 }}>
           <Card style={{ padding:20 }}>
+            <h3 style={{ fontWeight:700, marginBottom:4, color:T.text }}>Price Forecasting (NPR)</h3>
+            <p style={{ fontSize:12, color:T.textMuted, marginBottom:14 }}>ARIMA trend + LSTM demand + GARCH volatility blend</p>
+            <ResponsiveContainer width="100%" height={220}>
+              <AreaChart data={forecast.series}>
+                <CartesianGrid strokeDasharray="3 3" stroke={T.borderLight}/>
+                <XAxis dataKey="m" fontSize={11}/>
+                <YAxis fontSize={11} tickFormatter={v=>`रू${v}`}/>
+                <Tooltip formatter={v=>[npr(v),"Price"]}/>
+                <Area type="monotone" dataKey="actual" stroke={T.green} fill={T.greenPale} strokeWidth={2} name="Actual"/>
+                <Line type="monotone" dataKey="forecast" stroke={T.saffron} strokeWidth={2.5} dot name="Forecast"/>
+              </AreaChart>
+            </ResponsiveContainer>
+          </Card>
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            <Card style={{ padding:18 }}>
+              <div style={{ fontSize:11, color:T.textMuted, fontWeight:700 }}>Suggested Farmer Price</div>
+              <div style={{ fontSize:30, fontWeight:900, color:T.green }}>{npr(forecast.suggested)}</div>
+              <div style={{ fontSize:12, color:T.textMuted }}>Current: {npr(forecast.current)} / {p.unit}</div>
+            </Card>
+            {[["ARIMA",forecast.arima,T.sky],["LSTM",forecast.lstm,T.success],["GARCH",forecast.garch,T.warning]].map(([m,v,c])=>(
+              <Card key={m} style={{ padding:14 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <span style={{ fontSize:12, fontWeight:800, color:c }}>{m}</span>
+                  <span style={{ fontSize:16, fontWeight:900, color:T.text }}>{npr(v)}</span>
+                </div>
+              </Card>
+            ))}
+            <Card style={{ padding:14, background:forecast.highDemand?T.greenPale:T.alt }}>
+              <div style={{ fontSize:11, color:T.textMuted, fontWeight:700 }}>Demand Index</div>
+              <div style={{ fontSize:22, fontWeight:900, color:forecast.highDemand?T.success:T.warning }}>{forecast.demandIndex}/100</div>
+              <p style={{ fontSize:12, color:T.textMuted, marginTop:6 }}>{forecast.recommendation}</p>
+            </Card>
+          </div>
+          <Card style={{ padding:20, gridColumn:bp==="sm"?"span 1":"span 2" }}>
             <h3 style={{ fontWeight:700, marginBottom:16, color:T.text }}>Price History (NPR)</h3>
             <ResponsiveContainer width="100%" height={240}>
               <AreaChart data={PRICE_HISTORY}>
@@ -2179,6 +2295,7 @@ Respond ONLY with valid JSON, no markdown, no explanation outside JSON:
               </AreaChart>
             </ResponsiveContainer>
           </Card>
+          </div>
         )}
 
         {tab==="ai" && (
@@ -2264,7 +2381,7 @@ Respond ONLY with valid JSON, no markdown, no explanation outside JSON:
         )}
 
         {tab==="reviews" && (
-          <ReviewsTab product={p} user={null}/>
+          <ReviewsTab product={p} user={null} onRatingSubmitted={onRatingSubmitted}/>
         )}
       </div>
     </div>
@@ -2351,7 +2468,7 @@ const CartPage = ({ cart, setCart, nav }) => {
 /* ─────────────────────────────────────────────────────────────
    CHECKOUT
 ───────────────────────────────────────────────────────────── */
-const CheckoutPage = ({ cart, nav, onDone }) => {
+const CheckoutPage = ({ cart, nav, onDone, user, onCreateOrder }) => {
   const bp = useBreakpoint();
   const [step, setStep] = useState(1);
   const [pay, setPay] = useState("esewa");
@@ -2359,6 +2476,9 @@ const CheckoutPage = ({ cart, nav, onDone }) => {
   const [processing, setProcessing] = useState(false);
   const [done, setDone] = useState(false);
   const total = cart.reduce((s,i)=>s+fp(i)*i.qty,0);
+  const vat = Math.round(total * 0.13);
+  const logistics = calcLogisticsCharge(total, addr.district, cart);
+  const grandTotal = total + vat + logistics;
   const PAYS = [
     {id:"esewa",label:"eSewa",icon:"💚",color:T.esewa,desc:"Nepal's most popular wallet"},
     {id:"khalti",label:"Khalti",icon:"💜",color:T.khalti,desc:"Fast mobile payment"},
@@ -2371,6 +2491,7 @@ const CheckoutPage = ({ cart, nav, onDone }) => {
   const handlePay = async () => {
     setProcessing(true);
     await new Promise(r=>setTimeout(r,2000));
+    onCreateOrder?.({ cart, payLabel:PAYS.find(x=>x.id===pay)?.label || pay, addr, buyer:user?.name || addr.name || "Guest Buyer", logistics, vat, grandTotal });
     setProcessing(false); setDone(true);
     setTimeout(()=>{ onDone(); nav("orders"); }, 1500);
   };
@@ -2478,14 +2599,15 @@ const CheckoutPage = ({ cart, nav, onDone }) => {
               <div style={{ margin:"16px 0", padding:14, background:T.alt, borderRadius:10 }}>
                 <div style={{ display:"flex", justifyContent:"space-between", fontWeight:900, fontSize:15 }}>
                   <span>Total</span>
-                  <span style={{ color:T.green, fontFamily:"'Tiro Devanagari Sanskrit',serif" }}>{npr(total)}</span>
+                  <span style={{ color:T.green, fontFamily:"'Tiro Devanagari Sanskrit',serif" }}>{npr(grandTotal)}</span>
                 </div>
                 <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>Payment: {PAYS.find(x=>x.id===pay)?.label}</div>
+                <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>Logistics: {npr(logistics)} · VAT: {npr(vat)}</div>
               </div>
               <div style={{ display:"flex", gap:10 }}>
                 <Btn variant="secondary" onClick={()=>setStep(2)}>← Back</Btn>
                 <Btn variant="success" onClick={handlePay} disabled={processing} style={{ flex:1, justifyContent:"center" }}>
-                  {processing?"⏳ Processing...":<><Check size={15}/> Confirm — {npr(total)}</>}
+                  {processing?"⏳ Processing...":<><Check size={15}/> Confirm — {npr(grandTotal)}</>}
                 </Btn>
               </div>
             </Card>
@@ -2504,7 +2626,13 @@ const CheckoutPage = ({ cart, nav, onDone }) => {
           <div style={{ borderTop:`2px solid ${T.border}`, marginTop:10, paddingTop:10,
             display:"flex", justifyContent:"space-between", fontWeight:900, fontSize:15 }}>
             <span>Total</span>
-            <span style={{ color:T.green, fontFamily:"'Tiro Devanagari Sanskrit',serif" }}>{npr(total)}</span>
+            <span style={{ color:T.green, fontFamily:"'Tiro Devanagari Sanskrit',serif" }}>{npr(grandTotal)}</span>
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:T.textMuted, marginTop:8 }}>
+            <span>Logistics</span><span>{npr(logistics)}</span>
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:T.textMuted, marginTop:4 }}>
+            <span>VAT (13%)</span><span>{npr(vat)}</span>
           </div>
         </Card>
       </div>
@@ -2515,13 +2643,13 @@ const CheckoutPage = ({ cart, nav, onDone }) => {
 /* ─────────────────────────────────────────────────────────────
    ORDERS
 ───────────────────────────────────────────────────────────── */
-const OrdersPage = () => {
+const OrdersPage = ({ orders }) => {
   const bp = useBreakpoint();
   return (
     <div style={{ background:T.surface, minHeight:"100vh", padding:bp==="sm"?"16px":"28px 48px" }}>
       <h1 style={{ fontFamily:"'Tiro Devanagari Sanskrit',serif", fontSize:bp==="sm"?20:26, fontWeight:700, color:T.text, marginBottom:22 }}>मेरा अर्डरहरू</h1>
       <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
-        {ORDERS_DEMO.map(o=>(
+        {orders.map(o=>(
           <Card key={o.id} style={{ padding:bp==="sm"?16:22 }}>
             <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", flexWrap:"wrap", gap:10 }}>
               <div style={{ display:"flex", gap:12 }}>
@@ -2539,8 +2667,8 @@ const OrdersPage = () => {
             </div>
             {/* Progress */}
             <div style={{ marginTop:16, display:"flex" }}>
-              {["Pending","Processing","Shipped","Delivered"].map((s,i)=>{
-                const idx = ["Pending","Processing","Shipped","Delivered"].indexOf(o.status);
+              {ORDER_STATUSES.map((s,i)=>{
+                const idx = ORDER_STATUSES.indexOf(o.status);
                 const done = i<=idx;
                 return (
                   <div key={s} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:i===0?"flex-start":i===3?"flex-end":"center" }}>
@@ -2612,6 +2740,7 @@ const SD_TABS = [
   { id:"overview",  l:"Overview",    icon:BarChart2   },
   { id:"products",  l:"My Products", icon:Package     },
   { id:"orders",    l:"Orders",      icon:ShoppingBag },
+  { id:"forecast",  l:"Forecast",    icon:Activity    },
   { id:"add",       l:"Add Product", icon:Plus        },
   { id:"analytics", l:"Analytics",   icon:TrendingUp  },
 ];
@@ -2625,7 +2754,89 @@ const SD_TABS = [
    ✅ AI price via callClaude() — correct headers included
    ✅ StockBadge shown in table
 ───────────────────────────────────────────────────────────── */
-const SellerDash = ({ user }) => {
+const ForecastDashboard = ({ products=PRODUCTS }) => {
+  const bp = useBreakpoint();
+  const forecasts = topDemandForecasts(products);
+  const top = forecasts[0];
+  const avgSuggested = Math.round(forecasts.reduce((s,f)=>s+f.suggested,0) / Math.max(1, forecasts.length));
+  const volatile = [...forecasts].sort((a,b)=>b.volatility-a.volatility)[0];
+
+  return (
+    <div>
+      <h1 style={{ fontFamily:"'Tiro Devanagari Sanskrit',serif",
+        fontSize:bp==="sm"?20:24, fontWeight:700, color:T.text, marginBottom:8 }}>
+        Intelligent Price Forecasting
+      </h1>
+      <div style={{ fontSize:12, color:T.textMuted, marginBottom:18 }}>
+        ARIMA, LSTM and GARCH style models blended with demand, stock and logistics signals.
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:bp==="sm"?"1fr":"repeat(3,1fr)", gap:12, marginBottom:18 }}>
+        <Metric title="Highest Demand" value={top?.product || "-"} icon={Flame} color={T.red}/>
+        <Metric title="Avg Suggested Price" value={npr(avgSuggested)} icon={TrendingUp} color={T.green}/>
+        <Metric title="Highest Volatility" value={volatile?.product || "-"} icon={Activity} color={T.warning}/>
+      </div>
+      {top && (
+        <div style={{ display:"grid", gridTemplateColumns:bp==="sm"?"1fr":"2fr 1fr", gap:16, marginBottom:18 }}>
+          <Card style={{ padding:20 }}>
+            <h3 style={{ fontWeight:800, fontSize:16, color:T.text, marginBottom:4 }}>{top.img} {top.product}</h3>
+            <div style={{ fontSize:12, color:T.textMuted, marginBottom:14 }}>Highest demand product - Demand index {top.demandIndex}/100</div>
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={top.series}>
+                <CartesianGrid strokeDasharray="3 3" stroke={T.borderLight}/>
+                <XAxis dataKey="m" fontSize={11}/>
+                <YAxis fontSize={11} tickFormatter={v=>`रू${v}`}/>
+                <Tooltip formatter={v=>[npr(v),"Price"]}/>
+                <Line type="monotone" dataKey="actual" stroke={T.green} strokeWidth={2.5} name="Actual"/>
+                <Line type="monotone" dataKey="forecast" stroke={T.saffron} strokeWidth={2.5} name="Forecast"/>
+              </LineChart>
+            </ResponsiveContainer>
+          </Card>
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            <Card style={{ padding:18 }}>
+              <div style={{ fontSize:11, color:T.textMuted, fontWeight:700 }}>Suggested Price</div>
+              <div style={{ fontSize:30, fontWeight:900, color:T.green }}>{npr(top.suggested)}</div>
+              <div style={{ fontSize:12, color:T.textMuted }}>Current {npr(top.current)} / {top.unit}</div>
+            </Card>
+            {[["ARIMA",top.arima,T.sky],["LSTM",top.lstm,T.success],["GARCH",top.garch,T.warning]].map(([m,v,c])=>(
+              <Card key={m} style={{ padding:14 }}>
+                <div style={{ display:"flex", justifyContent:"space-between" }}>
+                  <span style={{ fontSize:12, color:c, fontWeight:800 }}>{m}</span>
+                  <span style={{ fontWeight:900 }}>{npr(v)}</span>
+                </div>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
+      <Card style={{ padding:18 }}>
+        <h3 style={{ fontWeight:800, fontSize:15, color:T.text, marginBottom:12 }}>Demand And Forecast Table</h3>
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", minWidth:760, borderCollapse:"collapse" }}>
+            <thead><tr style={{ background:T.alt }}>
+              {["Product","Demand","Current","ARIMA","LSTM","GARCH","Suggested","Signal"].map(h=>(
+                <th key={h} style={{ padding:"10px 12px", textAlign:"left", fontSize:11, color:T.textMuted }}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>{forecasts.map(f=>(
+              <tr key={f.id} style={{ borderBottom:`1px solid ${T.borderLight}` }}>
+                <td style={{ padding:"12px", fontSize:12, fontWeight:800 }}>{f.img} {f.product}</td>
+                <td style={{ padding:"12px", fontWeight:900, color:f.highDemand?T.success:T.warning }}>{f.demandIndex}</td>
+                <td style={{ padding:"12px" }}>{npr(f.current)}</td>
+                <td style={{ padding:"12px" }}>{npr(f.arima)}</td>
+                <td style={{ padding:"12px" }}>{npr(f.lstm)}</td>
+                <td style={{ padding:"12px" }}>{npr(f.garch)}</td>
+                <td style={{ padding:"12px", fontWeight:900, color:T.green }}>{npr(f.suggested)}</td>
+                <td style={{ padding:"12px", fontSize:12, fontWeight:800, color:f.trend==="rising"?T.success:f.trend==="falling"?T.danger:T.sky }}>{f.trend}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+const SellerDash = ({ user, orders }) => {
   const bp = useBreakpoint();
   const [tab, setTab] = useState("overview");
 
@@ -3017,6 +3228,10 @@ Respond ONLY valid JSON no markdown:
         )}
 
         {/* ══ ORDERS ════════════════════════════════════════════ */}
+        {tab==="forecast" && (
+          <ForecastDashboard products={sellerProducts}/>
+        )}
+
         {tab==="orders" && (
           <div>
             <h1 style={{ fontFamily:"'Tiro Devanagari Sanskrit',serif",
@@ -3034,7 +3249,7 @@ Respond ONLY valid JSON no markdown:
                   </tr>
                 </thead>
                 <tbody>
-                  {ORDERS_DEMO.map(o=>(
+                  {orders.map(o=>(
                     <tr key={o.id} style={{ borderBottom:`1px solid ${T.borderLight}` }}>
                       <td style={{ padding:"12px", fontSize:12, fontWeight:700, color:T.green }}>{o.id}</td>
                       <td style={{ padding:"12px", fontSize:12 }}>{o.product}</td>
@@ -3309,7 +3524,7 @@ Respond ONLY valid JSON no markdown:
    ✅ Confirmation dialogs before destructive actions
    ✅ Toast feedback on each action
 ───────────────────────────────────────────────────────────── */
-const AdminDash = () => {
+const AdminDash = ({ orders }) => {
   const bp = useBreakpoint();
   const [tab, setTab] = useState("overview");
 
@@ -3707,7 +3922,7 @@ const AdminDash = () => {
                       fontWeight:700, color:T.textMuted, borderBottom:`1px solid ${T.border}` }}>{h}</th>
                   ))}
                 </tr></thead>
-                <tbody>{ORDERS_DEMO.map(o=>(
+                <tbody>{orders.map(o=>(
                   <tr key={o.id} style={{ borderBottom:`1px solid ${T.borderLight}` }}>
                     <td style={{ padding:"12px", fontWeight:700, fontSize:12, color:T.green }}>{o.id}</td>
                     <td style={{ padding:"12px", fontSize:12 }}>{o.product}</td>
@@ -3856,6 +4071,100 @@ const AdminDash = () => {
 /* ─────────────────────────────────────────────────────────────
    AUTH
 ───────────────────────────────────────────────────────────── */
+const DeliveryDash = ({ orders, onStatusChange }) => {
+  const bp = useBreakpoint();
+  const [filter, setFilter] = useState("Active");
+  const visible = orders.filter(o =>
+    filter === "All" ? true :
+    filter === "Active" ? o.status !== "Delivered" :
+    o.status === filter
+  );
+
+  const counts = ORDER_STATUSES.reduce((acc, st) => ({
+    ...acc,
+    [st]: orders.filter(o => o.status === st).length,
+  }), {});
+
+  return (
+    <div style={{ background:T.surface, minHeight:"100vh", padding:bp==="sm"?"16px":"28px 48px" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", gap:12,
+        flexWrap:"wrap", marginBottom:20 }}>
+        <div>
+          <h1 style={{ fontFamily:"'Tiro Devanagari Sanskrit',serif", fontSize:bp==="sm"?20:26,
+            fontWeight:700, color:T.text }}>Delivery Tracking</h1>
+          <div style={{ fontSize:12, color:T.textMuted, marginTop:2 }}>
+            Update package status for buyer, seller, and admin dashboards
+          </div>
+        </div>
+        <Select value={filter} onChange={setFilter}
+          options={["Active","All",...ORDER_STATUSES].map(s=>({v:s,l:s}))}
+          style={{ minWidth:150 }}/>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:bp==="sm"?"repeat(2,1fr)":"repeat(4,1fr)",
+        gap:12, marginBottom:18 }}>
+        {ORDER_STATUSES.map(st=>(
+          <Card key={st} style={{ padding:"14px 16px" }}>
+            <div style={{ fontSize:11, color:T.textMuted, fontWeight:700 }}>{st}</div>
+            <div style={{ fontSize:24, fontWeight:900,
+              color:st==="Delivered"?T.success:st==="Shipped"?T.sky:st==="Processing"?T.warning:T.text }}>
+              {counts[st] || 0}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+        {visible.map(o=>{
+          const current = ORDER_STATUSES.indexOf(o.status);
+          return (
+            <Card key={o.id} style={{ padding:bp==="sm"?16:20 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", gap:14, flexWrap:"wrap" }}>
+                <div style={{ display:"flex", gap:12, minWidth:260 }}>
+                  <div style={{ width:48, height:48, borderRadius:10, background:T.greenPale,
+                    display:"flex", alignItems:"center", justifyContent:"center" }}>
+                    <Truck size={22} color={T.green}/>
+                  </div>
+                  <div>
+                    <div style={{ fontWeight:800, color:T.text }}>{o.product}</div>
+                    <div style={{ fontSize:12, color:T.textMuted }}>#{o.id} - {o.buyer} - {o.pay}</div>
+                    <div style={{ fontSize:12, color:T.textMuted }}>
+                      {o.address?.district || "Nepal"} {o.address?.street ? `- ${o.address.street}` : ""}
+                    </div>
+                    <div style={{ marginTop:5 }}><Badge status={o.status}/></div>
+                  </div>
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                  <Select value={o.status} onChange={v=>onStatusChange(o.id, v)}
+                    options={ORDER_STATUSES.map(st=>({v:st,l:st}))}
+                    style={{ minWidth:140 }}/>
+                  {ORDER_STATUSES.map((st, i)=>(
+                    <button key={st} onClick={()=>onStatusChange(o.id, st)}
+                      disabled={o.status===st}
+                      title={`Mark ${st}`}
+                      style={{ width:34, height:34, borderRadius:8, border:`1px solid ${i<=current?T.green:T.border}`,
+                        background:o.status===st?T.green:i<=current?T.greenPale:T.card,
+                        color:o.status===st?"#fff":i<=current?T.green:T.textMuted,
+                        cursor:o.status===st?"default":"pointer", display:"flex", alignItems:"center",
+                        justifyContent:"center" }}>
+                      {i<=current ? <Check size={14}/> : i+1}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+        {visible.length === 0 && (
+          <Card style={{ padding:34, textAlign:"center", color:T.textMuted }}>
+            No orders for this delivery filter.
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const AuthPage = ({ mode, onLogin, nav }) => {
   const bp = useBreakpoint();
   const [name, setName] = useState("");
@@ -3867,6 +4176,7 @@ const AuthPage = ({ mode, onLogin, nav }) => {
   const DEMO = [
     { label:"🛒 Buyer (Ram Bahadur)", email:"buyer@hariyo.np", name:"Ram Bahadur Thapa", role:"buyer" },
     { label:"👨‍🌾 Seller (Ilam Tea Estate)", email:"seller@hariyo.np", name:"Ilam Tea Estate", role:"seller" },
+    { label:"Delivery Postman", email:"delivery@hariyo.np", name:"Delivery Postman", role:"delivery" },
     { label:"🏛️ Admin", email:"admin@hariyo.np", name:"Admin User", role:"admin" },
   ];
 
@@ -3928,6 +4238,8 @@ export default function App() {
   const [pageData,   setPageData]   = useState(null);
   const [user,       setUser]       = useState(null);
   const [cart,       setCart]       = useState([]);
+  const [orders,     setOrders]     = useState(ORDERS_DEMO);
+  const [productRatings, setProductRatings] = useState({});
   const [toast,      setToast]      = useState(null);
   const [activeCat,  setActiveCat]  = useState("all");
   const [globalSearch, setGlobalSearch] = useState("");
@@ -3956,11 +4268,38 @@ export default function App() {
     showToast(`${p.name} कार्टमा थपियो!`);
   };
 
+  const createOrder = ({ cart: orderCart, payLabel, addr, buyer, logistics=0, vat=0, grandTotal=null }) => {
+    if (!orderCart?.length) return;
+    const amount = orderCart.reduce((s,i)=>s+fp(i)*i.qty,0);
+    const order = {
+      id: `HB-${Date.now().toString().slice(-5)}`,
+      product: orderCart.length === 1 ? orderCart[0].name : `${orderCart[0].name} + ${orderCart.length - 1} more`,
+      qty: orderCart.reduce((s,i)=>s+i.qty,0),
+      amount: grandTotal ?? amount,
+      status: "Pending",
+      date: new Date().toISOString().slice(0,10),
+      buyer,
+      pay: payLabel,
+      logistics,
+      vat,
+      address: addr,
+      items: orderCart.map(i=>({ id:i.id, name:i.name, qty:i.qty, price:fp(i), seller:i.seller })),
+    };
+    setOrders(prev => [order, ...prev]);
+    showToast(`Order ${order.id} confirmed and marked Pending.`);
+  };
+
+  const updateOrderStatus = (orderId, status) => {
+    setOrders(prev => prev.map(o => o.id === orderId ? { ...o, status } : o));
+    showToast(`Order ${orderId} updated to ${status}.`);
+  };
+
   const login = u => {
     setUser(u);
     showToast(`स्वागत छ, ${u.name.split(" ")[0]}!`);
     if (u.role==="admin") nav("admin");
     else if (u.role==="seller") nav("seller");
+    else if (u.role==="delivery") nav("delivery");
     else nav("home");
   };
 
@@ -3985,6 +4324,16 @@ export default function App() {
   };
 
   const noNav = page==="login" || page==="register";
+  const products = PRODUCTS.map(p => productRatings[p.id] ? { ...p, ...productRatings[p.id] } : p);
+  const selectedProduct = pageData?.id ? (products.find(p=>p.id===pageData.id) || pageData) : pageData;
+
+  const updateProductRating = (productId, avgRating, reviewCount) => {
+    setProductRatings(prev => ({
+      ...prev,
+      [productId]: { rating: Math.round(avgRating * 10) / 10, reviews: reviewCount },
+    }));
+    showToast("Rating updated. Thanks for the market signal.");
+  };
 
   return (
     <div style={{ fontFamily:"'Hind',sans-serif", background:T.surface, minHeight:"100vh" }}>
@@ -4030,18 +4379,19 @@ export default function App() {
             onSearch={handleSearch}
           />
           <div style={{ animation:"fadeIn 0.2s ease" }}>
-            {page==="home"     && <HomePage nav={nav} addCart={addCart} setActiveCat={handleCatChange}/>}
+            {page==="home"     && <HomePage nav={nav} addCart={addCart} setActiveCat={handleCatChange} products={products}/>}
             {page==="products" && (
               <ProductsPage nav={nav} addCart={addCart}
-                activeCat={activeCat} setActiveCat={setActiveCat}
+                activeCat={activeCat} setActiveCat={setActiveCat} products={products}
                 globalSearch={globalSearch}/>
             )}
-            {page==="product"  && <ProductDetail product={pageData} nav={nav} addCart={addCart}/>}
+            {page==="product"  && <ProductDetail product={selectedProduct} nav={nav} addCart={addCart} onRatingSubmitted={updateProductRating}/>}
             {page==="cart"     && <CartPage cart={cart} setCart={setCart} nav={nav}/>}
-            {page==="checkout" && <CheckoutPage cart={cart} nav={nav} onDone={()=>setCart([])}/>}
-            {page==="orders"   && <OrdersPage/>}
-            {page==="seller"   && <SellerDash user={user}/>}
-            {page==="admin"    && <AdminDash/>}
+            {page==="checkout" && <CheckoutPage cart={cart} nav={nav} user={user} onCreateOrder={createOrder} onDone={()=>setCart([])}/>}
+            {page==="orders"   && <OrdersPage orders={orders}/>}
+            {page==="seller"   && <SellerDash user={user} orders={orders}/>}
+            {page==="admin"    && <AdminDash orders={orders}/>}
+            {page==="delivery" && <DeliveryDash orders={orders} onStatusChange={updateOrderStatus}/>}
           </div>
         </>
       )}
