@@ -47,6 +47,26 @@ const T = {
   warning:      "#E65100",
 };
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:3000/api";
+
+const apiRequest = async (path, { token, ...options } = {}) => {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.message || "Request failed");
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+};
+
 /* ─────────────────────────────────────────────────────────────
    STATIC DATA
 ───────────────────────────────────────────────────────────── */
@@ -2468,11 +2488,13 @@ const CartPage = ({ cart, setCart, nav }) => {
 /* ─────────────────────────────────────────────────────────────
    CHECKOUT
 ───────────────────────────────────────────────────────────── */
-const CheckoutPage = ({ cart, nav, onDone, user, onCreateOrder }) => {
+const CheckoutPage = ({ cart, nav, onDone, user, token, onCreateOrder }) => {
   const bp = useBreakpoint();
   const [step, setStep] = useState(1);
   const [pay, setPay] = useState("esewa");
-  const [addr, setAddr] = useState({ name:"", phone:"", district:"", street:"" });
+  const [addr, setAddr] = useState({ name:user?.name || "", phone:user?.phone || "", district:"", street:"" });
+  const [payAuth, setPayAuth] = useState({ phone:user?.phone || "", password:"", mpin:"" });
+  const [payError, setPayError] = useState("");
   const [processing, setProcessing] = useState(false);
   const [done, setDone] = useState(false);
   const total = cart.reduce((s,i)=>s+fp(i)*i.qty,0);
@@ -2488,12 +2510,48 @@ const CheckoutPage = ({ cart, nav, onDone, user, onCreateOrder }) => {
     {id:"stripe",label:"Card (Stripe)",icon:"💳",color:"#635BFF",desc:"Visa / Mastercard"},
   ];
 
+  const verifyPayment = async () => {
+    if (!/^(97|98)\d{8}$/.test(payAuth.phone)) throw new Error("Enter a valid 10 digit Nepali mobile number.");
+    if (!payAuth.password) throw new Error("Password is required for payment verification.");
+    if (!/^\d{4,6}$/.test(payAuth.mpin)) throw new Error("MPIN must be 4 to 6 digits.");
+
+    if (token) {
+      await apiRequest("/payments/verify", {
+        method: "POST",
+        token,
+        body: JSON.stringify({ ...payAuth, method: pay }),
+      });
+    }
+  };
+
   const handlePay = async () => {
+    setPayError("");
+    if (!user) {
+      nav("login");
+      return;
+    }
     setProcessing(true);
-    await new Promise(r=>setTimeout(r,2000));
-    onCreateOrder?.({ cart, payLabel:PAYS.find(x=>x.id===pay)?.label || pay, addr, buyer:user?.name || addr.name || "Guest Buyer", logistics, vat, grandTotal });
-    setProcessing(false); setDone(true);
-    setTimeout(()=>{ onDone(); nav("orders"); }, 1500);
+    try {
+      await verifyPayment();
+      await new Promise(r=>setTimeout(r,700));
+      await onCreateOrder?.({
+        cart,
+        pay,
+        payLabel:PAYS.find(x=>x.id===pay)?.label || pay,
+        addr,
+        buyer:user?.name || addr.name || "Guest Buyer",
+        logistics,
+        vat,
+        grandTotal,
+        paymentVerified:true,
+      });
+      setDone(true);
+      setTimeout(()=>{ onDone(); nav("orders"); }, 1500);
+    } catch (err) {
+      setPayError(err.message || "Payment verification failed.");
+    } finally {
+      setProcessing(false);
+    }
   };
 
   if (done) return (
@@ -2602,6 +2660,15 @@ const CheckoutPage = ({ cart, nav, onDone, user, onCreateOrder }) => {
                   <span style={{ color:T.green, fontFamily:"'Tiro Devanagari Sanskrit',serif" }}>{npr(grandTotal)}</span>
                 </div>
                 <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>Payment: {PAYS.find(x=>x.id===pay)?.label}</div>
+                <div style={{ marginTop:12, padding:14, background:T.greenPale, border:`1px solid ${T.green}30`, borderRadius:10 }}>
+                  <div style={{ fontWeight:800, fontSize:13, color:T.text, marginBottom:10 }}>Payment verification</div>
+                  <div style={{ display:"grid", gridTemplateColumns:bp==="sm"?"1fr":"1fr 1fr 1fr", gap:10 }}>
+                    <Input label="Mobile Number" value={payAuth.phone} onChange={v=>setPayAuth(a=>({...a,phone:v}))} placeholder="98XXXXXXXX"/>
+                    <Input label="Password" value={payAuth.password} onChange={v=>setPayAuth(a=>({...a,password:v}))} type="password"/>
+                    <Input label="MPIN" value={payAuth.mpin} onChange={v=>setPayAuth(a=>({...a,mpin:v.replace(/\D/g,'').slice(0,6)}))} type="password" placeholder="4-6 digits"/>
+                  </div>
+                  {payError && <div style={{ marginTop:10, color:T.danger, fontSize:12, fontWeight:700 }}>{payError}</div>}
+                </div>
                 <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>Logistics: {npr(logistics)} · VAT: {npr(vat)}</div>
               </div>
               <div style={{ display:"flex", gap:10 }}>
@@ -4169,8 +4236,12 @@ const AuthPage = ({ mode, onLogin, nav }) => {
   const bp = useBreakpoint();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("buyer@hariyo.np");
+  const [phone, setPhone] = useState("9800000001");
   const [pass, setPass] = useState("password");
+  const [mpin, setMpin] = useState("1234");
   const [role, setRole] = useState("buyer");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
   const isLogin = mode==="login";
 
   const DEMO = [
@@ -4179,6 +4250,23 @@ const AuthPage = ({ mode, onLogin, nav }) => {
     { label:"Delivery Postman", email:"delivery@hariyo.np", name:"Delivery Postman", role:"delivery" },
     { label:"🏛️ Admin", email:"admin@hariyo.np", name:"Admin User", role:"admin" },
   ];
+
+  const handleSubmit = async () => {
+    setError("");
+    setLoading(true);
+    try {
+      const data = await apiRequest(isLogin ? "/auth/login" : "/auth/register", {
+        method:"POST",
+        body:JSON.stringify(isLogin ? { email, password:pass } : { name, email, phone, password:pass, mpin, role }),
+      });
+      onLogin(data.user, data.token);
+    } catch (err) {
+      if (isLogin && !err.status) onLogin({ name:name || "Ram Bahadur", email, phone, role });
+      else setError(err.message || (isLogin ? "Unable to login." : "Unable to create account."));
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <div style={{ minHeight:"100vh", background:`linear-gradient(135deg, ${T.dark}, #0D2B18)`,
@@ -4209,10 +4297,13 @@ const AuthPage = ({ mode, onLogin, nav }) => {
           <div style={{ borderTop:`1px solid ${T.borderLight}`, paddingTop:16, display:"flex", flexDirection:"column", gap:12 }}>
             {!isLogin && <Input label="Full Name" value={name} onChange={setName} placeholder="Your name"/>}
             <Input label="Email" value={email} onChange={setEmail} type="email"/>
+            {!isLogin && <Input label="Mobile Number" value={phone} onChange={v=>setPhone(v.replace(/\D/g,'').slice(0,10))} placeholder="98XXXXXXXX"/>}
             <Input label="Password" value={pass} onChange={setPass} type="password"/>
+            {!isLogin && <Input label="Payment MPIN" value={mpin} onChange={v=>setMpin(v.replace(/\D/g,'').slice(0,6))} type="password" placeholder="4-6 digits"/>}
             {!isLogin && <Select label="Register as" value={role} onChange={setRole}
               options={[{v:"buyer",l:"🛒 Buyer"},{v:"seller",l:"👨‍🌾 Farmer / Seller"}]}/>}
-            <Btn variant="primary" size="lg" onClick={()=>onLogin({name:name||"Ram Bahadur",email,role})}
+            {error && <div style={{ color:T.danger, fontSize:12, fontWeight:700 }}>{error}</div>}
+            <Btn variant="primary" size="lg" onClick={handleSubmit} disabled={loading}
               style={{ width:"100%", justifyContent:"center", marginTop:4 }}>
               {isLogin?"लगइन गर्नुहोस्":"खाता बनाउनुहोस्"}
             </Btn>
@@ -4236,7 +4327,10 @@ const AuthPage = ({ mode, onLogin, nav }) => {
 export default function App() {
   const [page,       setPage]       = useState("home");
   const [pageData,   setPageData]   = useState(null);
-  const [user,       setUser]       = useState(null);
+  const [user,       setUser]       = useState(() => {
+    try { return JSON.parse(localStorage.getItem("hariyo_user") || "null"); } catch { return null; }
+  });
+  const [token,      setToken]      = useState(() => localStorage.getItem("hariyo_token") || "");
   const [cart,       setCart]       = useState([]);
   const [orders,     setOrders]     = useState(ORDERS_DEMO);
   const [productRatings, setProductRatings] = useState({});
@@ -4268,9 +4362,24 @@ export default function App() {
     showToast(`${p.name} कार्टमा थपियो!`);
   };
 
-  const createOrder = ({ cart: orderCart, payLabel, addr, buyer, logistics=0, vat=0, grandTotal=null }) => {
+  const createOrder = async ({ cart: orderCart, pay, payLabel, addr, buyer, logistics=0, vat=0, grandTotal=null, paymentVerified=false }) => {
     if (!orderCart?.length) return;
     const amount = orderCart.reduce((s,i)=>s+fp(i)*i.qty,0);
+    if (token) {
+      await apiRequest("/orders", {
+        method:"POST",
+        token,
+        body:JSON.stringify({
+          items: orderCart.map(i=>({ product:i._id, name:i.name, qty:i.qty, price:fp(i), seller:i.seller })),
+          deliveryAddress: addr,
+          paymentMethod: pay || "cod",
+          paymentVerified,
+          logistics,
+          vat,
+          total: grandTotal ?? amount,
+        }),
+      });
+    }
     const order = {
       id: `HB-${Date.now().toString().slice(-5)}`,
       product: orderCart.length === 1 ? orderCart[0].name : `${orderCart[0].name} + ${orderCart.length - 1} more`,
@@ -4294,8 +4403,12 @@ export default function App() {
     showToast(`Order ${orderId} updated to ${status}.`);
   };
 
-  const login = u => {
+  const login = (u, authToken="") => {
     setUser(u);
+    setToken(authToken);
+    localStorage.setItem("hariyo_user", JSON.stringify(u));
+    if (authToken) localStorage.setItem("hariyo_token", authToken);
+    else localStorage.removeItem("hariyo_token");
     showToast(`स्वागत छ, ${u.name.split(" ")[0]}!`);
     if (u.role==="admin") nav("admin");
     else if (u.role==="seller") nav("seller");
@@ -4305,6 +4418,9 @@ export default function App() {
 
   const logout = () => {
     setUser(null);
+    setToken("");
+    localStorage.removeItem("hariyo_user");
+    localStorage.removeItem("hariyo_token");
     setCart([]);
     setActiveCat("all");
     setGlobalSearch("");
@@ -4387,7 +4503,7 @@ export default function App() {
             )}
             {page==="product"  && <ProductDetail product={selectedProduct} nav={nav} addCart={addCart} onRatingSubmitted={updateProductRating}/>}
             {page==="cart"     && <CartPage cart={cart} setCart={setCart} nav={nav}/>}
-            {page==="checkout" && <CheckoutPage cart={cart} nav={nav} user={user} onCreateOrder={createOrder} onDone={()=>setCart([])}/>}
+            {page==="checkout" && <CheckoutPage cart={cart} nav={nav} user={user} token={token} onCreateOrder={createOrder} onDone={()=>setCart([])}/>}
             {page==="orders"   && <OrdersPage orders={orders}/>}
             {page==="seller"   && <SellerDash user={user} orders={orders}/>}
             {page==="admin"    && <AdminDash orders={orders}/>}

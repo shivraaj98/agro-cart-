@@ -35,7 +35,16 @@ agro-cart-/
 |-- package.json            # Scripts and dependencies
 |-- package-lock.json       # Locked dependency versions
 |-- dist/                   # Production build output
-|-- backend/                # Placeholder/backend folder
+|-- backend/                # Express + MongoDB API
+|   |-- server.js           # API entry point
+|   |-- index.js            # Start wrapper
+|   |-- .env.example        # Backend environment template
+|   `-- src/
+|       |-- config/db.js
+|       |-- middleware/auth.js
+|       |-- models/         # User, Product, Order, PaymentVerification
+|       |-- routes/         # auth, products, orders, payments
+|       `-- utils/token.js
 `-- config/                 # Config folder
 ```
 
@@ -78,6 +87,47 @@ Open:
 ```text
 http://127.0.0.1:5173
 ```
+
+## Backend Setup
+
+The backend uses Express, MongoDB, Mongoose, JWT, bcrypt password hashing, and MPIN hashing.
+
+```bash
+cd backend
+npm install
+copy .env.example .env
+npm run dev
+```
+
+Update `backend/.env` with your MongoDB connection string and a strong `JWT_SECRET`.
+
+Optional demo users:
+
+```bash
+npm run seed
+```
+
+Seeded demo users use password `password` and payment MPIN `1234`.
+
+API base URL for the frontend defaults to:
+
+```text
+http://127.0.0.1:3000/api
+```
+
+To change it, create a frontend `.env` file:
+
+```text
+VITE_API_BASE_URL=http://127.0.0.1:3000/api
+```
+
+## Auth And Payment Verification
+
+- Users register with name, email, mobile number, password, MPIN, and role.
+- Passwords and MPINs are stored as bcrypt hashes in MongoDB.
+- Login returns a JWT and safe user profile.
+- Checkout payment verification requires the logged-in user's mobile number, password, and MPIN.
+- Orders are accepted by the API only when `paymentVerified` is true.
 
 ## Demo Logins
 
